@@ -676,6 +676,8 @@ int lstat(const char *path, struct stat *buf);
 - `lstat`对于软链接文件则获取此文件本身信息，其余与上面一致
 - 成功执行返回 0，失败返回 -1 并设置 errno
 
+`stat`结构体定义如下
+
 ```c
 struct stat {
     dev_t     st_dev;         /* ID of device containing file */
@@ -703,7 +705,409 @@ struct stat {
 };
 ```
 
+- `off_t`类型在 32 位机器上 gcc 会编译为`long int`，在 64 位机器上则会编译为`long long int`，具体可以查看`unistd.h`中的定义
 
+  ```c
+  # ifndef __off_t_defined
+  #  ifndef __USE_FILE_OFFSET64
+  typedef __off_t off_t;
+  #  else
+  typedef __off64_t off_t;
+  #  endif
+  #  define __off_t_defined
+  # endif
+  # if defined __USE_LARGEFILE64 && !defined __off64_t_defined
+  typedef __off64_t off64_t;
+  #  define __off64_t_defined
+  # endif
+  ```
+
+注意到`stat`结构体中有三个域
+
+```c
+off_t     st_size;        /* Total size, in bytes */
+blksize_t st_blksize;     /* Block size for filesystem I/O */
+blkcnt_t  st_blocks;      /* Number of 512B blocks allocated */
+```
+
+- 块大小一般为 4096 字节
+- `st_size`是文件的逻辑大小
+- `st_blksize * st_block`是文件的物理大小，其值不一定等于`st_size`
+
+`lseek`允许将文件偏移移动到超过文件长度的位置，倘若将文件偏移移动到超过文件大小的位置再写入内容，将会拓展文件的逻辑大小，并在前文件结尾与当前写入位置之间产生一个文件空洞，这种文件就叫做空洞文件。文件空洞部分在被写入实际内容前不会被分配物理空间，但会被算入文件的逻辑大小`st_size`、
+
+空洞文件的一个作用是多线程文件操作，对于一个大文件我们可以先创建一个文件空洞并进行多线程分段写入，这比单线程更高效。比如`BitTorrent`协议多线程下载时就可以先创建一个空洞文件，再分配多个线程分别从不同地址下载并写入其负责的文件块
+
+对于`/proc`伪文件系统中的大部分文件`stat`函数和命令都不会返回其`st_size`域，故返回值默认为 0。这在旧版 man 手册中有所提及（应该是旧版，目前机器上的 man 手册已经找不到这段了，但实验证明其`st_size`域依旧只返回 0。贴个链接：[stat(2): file status - Linux man page (die.net)](https://linux.die.net/man/2/stat)）
+
+> For most files under the */proc* directory, **stat**() does not return the file size in the *st_size* field; instead the field is returned with the value 0.
+
+而如果将其中的空文件复制到一个实际的文件系统中则会重新体现其物理文件大小
+
+```shell
+$ cp /proc/stat /tmp/stat
+$ stat /proc/stat
+  文件：/proc/stat
+  大小：0               块：0          IO 块大小：1024   普通空文件
+设备：16h/22d   Inode：4026532034  硬链接：1
+权限：(0444/-r--r--r--)  Uid: (    0/    root)   Gid: (    0/    root)
+访问时间：2023-10-05 20:38:34.847999991 +0800
+修改时间：2023-10-05 20:38:34.847999991 +0800
+变更时间：2023-10-05 20:38:34.847999991 +0800
+创建时间：-
+$ stat /tmp/stat
+  文件：/tmp/stat
+  大小：6034            块：16         IO 块大小：4096   普通文件
+设备：10302h/66306d     Inode：38535194    硬链接：1
+权限：(0444/-r--r--r--)  Uid: ( 1000/   asuka)   Gid: ( 1000/   asuka)
+访问时间：2023-10-22 11:15:57.871455090 +0800
+修改时间：2023-10-22 11:15:57.871455090 +0800
+变更时间：2023-10-22 11:15:57.871455090 +0800
+创建时间：2023-10-22 11:15:57.871455090 +0800
+```
+
+`st_mode`是一个 16 位的位图，记录了文件的权限信息和部分文件属性信息
+
+![st_mode](./img/st_mode.png)
+
+- 黏着位（`S_ISVTX`）曾被用于在进程退出时将文件保存在 swap 分区中以加速下次启动进程，此功能已经在现代系统中废除，如今的功能是限定文件仅允许属主与 root 删除，典型应用就是`/tmp`目录，`t`位即为黏住位的体现
+
+  ```shell
+  drwxrwxrwt  52 root root  12K 10月 22 11:32 tmp
+  ```
+
+### FAT 文件系统、UFS 文件系统
+
+内容太多，以后另开文章
+
+### 链接文件
+
+链接文件有硬链接与符号链接（不是软链接）
+
+硬链接可以由`ln`指令创建，但不能为分区和目录创建硬链接
+
+硬链接文件本身不会创建新的`iNode`，而是在父目录文件中创建一个指向原文件的目录项来实现的。由于硬链接文件与源文件共享`iNode`与数据块，对任意一方的修改操作都会影响另一方，但删除操作只会减少文件的链接数，直到链接数为 0 才算真正从文件系统中删除文件，链接数可以在`stat`结构体中的`st_nlink`域中体现
+
+```c
+nlink_t   st_nlink;       /* Number of hard links */
+```
+
+`link`函数可以用于创建硬链接
+
+```c
+#include <unistd.h>
+
+int link(const char *oldpath, const char *newpath);
+```
+
+`unlink`函数可以删除一个文件的目录项并减少它的链接数，执行成功则返回 0，否则返回 -1 并设置 errno
+
+```c
+#include <unistd.h>
+
+int unlink(const char *pathname);
+```
+
+符号链接可以使用`ln -s`命令创建，与硬链接不同的之处是不能为分区和目录创建硬链接，但可以创建符号链接
+
+符号链接与硬链接不同，其会切实创建一个内容为目标路径的文件，类似于 Windows 里的“快捷方式”，删除原文件后链接文件依旧存在，但会变为非法链接
+
+### 常用文件操作
+
+```c
+#include <stdio.h>
+
+int remove(const char *pathname);
+int rename(const char *oldpath, const char *newpath);
+```
+
+- `remove`：即`rm`
+- `rename`：即`mv`，重命名即是`mv [old_filename] [new_filename]`
+
+```c
+#include <sys/types.h>
+#include <utime.h>
+
+int utime(const char *filename, const struct utimbuf *times);
+```
+
+- `uname`：更改文件最后读时间与最后修改时间，不是很常用
+
+```c
+#include <unistd.h>
+
+int chdir(const char *path);
+int fchdir(int fd);
+```
+
+- `chdir`：即`cd`，更改程序的工作路径
+- `fchdir`：将工作目录更改到`fd`打开的目录处
+
+```c
+#include <unistd.h>
+
+char *getcwd(char *buf, size_t size);
+char *getwd(char *buf);
+char *get_current_dir_name(void);
+```
+
+- `getcwd`：即`pwd`
+- `getwd`：旧版的`getcwd`，有缓冲区溢出的风险故不推荐使用
+- `get_current_dir_name`：无需考虑缓冲区大小的`getcwd`，由于使用`malloc`动态分配内存故要记得用完释放
+  - 是不是感觉函数命名风格很突兀，因为这是 GNU extension
+
+### glob、目录解析
+
+```c
+#include <glob.h>
+
+int glob(const char *pattern, int flags,
+         int (*errfunc) (const char *epath, int eerrno),
+         glob_t *pglob);
+void globfree(glob_t *pglob);
+```
+
+- `glob`：解析模式串，将结果存放到`pglob`结构体中，执行成功返回 0，失败按失败原因返回特定的宏值
+  - `pattern`：将要解析的路径的模式串，支持通配符（不是正则匹配）
+  - `flags`：解析模式
+  - `errfunc`：错误处理函数，解析失败就会调用该函数
+  - `pglob`：指向存放解析结果的结构体
+- `globfree`：释放`glob`申请的空间
+
+`pglob`结构体定义如下
+
+```c
+typedef struct {
+	size_t   gl_pathc;    /* Count of paths matched so far  */
+	char   **gl_pathv;    /* List of matched pathnames.  */
+	size_t   gl_offs;     /* Slots to reserve in gl_pathv.  */
+} glob_t;
+```
+
+- 可以看到其设计非常像`argc`、`**argv`，解析结果时也应当依赖于这些参数
+
+### 目录函数
+
+打开/关闭目录
+
+```c
+#include <sys/types.h>
+#include <dirent.h>
+
+DIR *opendir(const char *name);
+DIR *fdopendir(int fd);
+int closedir(DIR *dirp);
+```
+
+- `opendir`、`fdopendir`：打开目录文件，结果指向堆区
+- `closedir`：关闭打开的目录文件，释放占用的内存
+
+读目录文件
+
+```c
+#include <dirent.h>
+
+struct dirent *readdir(DIR *drip);
+```
+
+- `readdir`：循环遍历打开的目录，执行成功返回记录目录项信息的`dirent`结构体指针，失败返回 NULL
+
+`dirent`结构体定义如下
+
+```c
+struct dirent {
+	ino_t          d_ino;       /* Inode number */
+	off_t          d_off;       /* Not an offset; see below */
+	unsigned short d_reclen;    /* Length of this record */
+	unsigned char  d_type;      /* Type of file; not supported
+	                               by all filesystem types */
+	char           d_name[256]; /* Null-terminated filename */
+};
+```
+
+- `d_off`本应是指目录项在目录文件中的偏移，但现代文件系统中很少会体现目录偏移量，故 man 手册不建议对它做任何假设并使用它
+
+还有一些其他目录函数，与文件操作函数类似，这里不一一展开讲解
+
+- `void rewinddir(DIR *dp)`：将读取位置回溯到开头
+- `long int telldir(DIR *dp)`：返回当前读取位置距离起始位置的偏移量
+- `void seekdir(DIR *dp, long int loc)`：设置读取位置到距离起始位置`loc`处
+
+## 系统数据文件与信息
+
+### 用户信息
+
+获取用户信息
+
+```c
+#include <sys/types.h>
+#include <pwd.h>
+
+struct passwd *getpwnam(const char *name);
+struct passwd *getpwuid(uid_t uid);
+```
+
+- 函数根据用户名或 uid 来获取用户信息，并返回一个`passwd`结构体，这些信息与`/etc/passwd`文件中的记录一致
+
+`passwd`结构体定义如下
+
+```c
+struct passwd {
+	char   *pw_name;       /* username */
+	char   *pw_passwd;     /* user password */
+	uid_t   pw_uid;        /* user ID */
+	gid_t   pw_gid;        /* group ID */
+	char   *pw_gecos;      /* user information */
+	char   *pw_dir;        /* home directory */
+	char   *pw_shell;      /* shell program */
+};
+```
+
+用户组信息
+
+```c
+#include <sys/types.h>
+#include <grp.h>
+
+struct group *getgrnam(const char *name);
+struct group *getgrgid(gid_t gid);
+```
+
+- 根据用户组名或 gid 来获取用户组信息，返回一个`group`结构体，与`/etc/group`信息一致
+
+`group`结构体定义如下
+
+```c
+struct group {
+	char   *gr_name;        /* group name */
+	char   *gr_passwd;      /* group password */
+	gid_t   gr_gid;         /* group ID */
+	char  **gr_mem;         /* NULL-terminated array of pointers
+                               to names of group members */
+};
+```
+
+### 口令
+
+获取口令信息
+
+```c
+#include <shadow.h>
+
+struct spwd *getspnam(const char *name);
+```
+
+- 通过用户名获取`/etc/shadow`内对应用户的信息，并返回一个`spwd`结构体
+  - 只有 root 用户能正确执行包含此函数的程序
+
+`spwd`结构体定义如下
+
+```c
+struct spwd {
+	char *sp_namp;     /* Login name */
+    char *sp_pwdp;     /* Encrypted password */
+    long  sp_lstchg;   /* Date of last change
+                          (measured in days since
+                          1970-01-01 00:00:00 +0000 (UTC)) */
+	long  sp_min;      /* Min # of days between changes */
+    long  sp_max;      /* Max # of days between changes */
+    long  sp_warn;     /* # of days before password expires
+                          to warn user to change it */
+    long  sp_inact;    /* # of days after password expires
+                          until account is disabled */
+    long  sp_expire;   /* Date when account expires
+                          (measured in days since
+                          1970-01-01 00:00:00 +0000 (UTC)) */
+    unsigned long sp_flag;  /* Reserved */
+};
+```
+
+口令加密
+
+```c
+#include <crypt.h>
+
+char *crypt(const char *phrase, const char *setting);
+```
+
+这里与 APUE 有所出入（新旧版用法相同），旧版 man 手册介绍如下
+
+```c
+#define _XOPEN_SOURCE
+#include <unistd.h>
+
+char *crypt(const char *key, const char *salt);
+```
+
+- `phrase`域（``key`域）就是要加密的字符串
+- `setting`域（`salt`域）指定加密方式与盐或其他加密相关内容
+  - setting 串以`$`符号划分加密方式选项和对应的参数，参数个数与选择的加密方式有关，形式为`$id$xx$...$xx$`
+    - 以 SHA-512 为例，其形式为`$id$salt$`
+    - 下面先按 SHA-512 来讲解
+  - `id`用于指定 hash 方法，1 是 MD5，5 是 SHA-256，6 是 SHA-512，y 是 yescrypt，还有一些其他的方法
+    - 现在的 Linux 中都默认使用 yescrypt 或 SHA-512 来对用户口令进行加密，这在`/etc/shadow`中有所体现
+  - `salt`就是要加的盐
+- 函数返回一个字符串，同样以`$`符号划分拼接传入的 setting 串和加密结果，其形式与`/etc/shadow`一致
+- 编译时需要加参数`-lcrypt`链接`libcrypt`库
+
+### 时间与日期
+
+APUE 总结的各个时间函数的关系如下
+
+![time functions](./img/time functions.png)
+
+```c
+#include <time.h>
+
+time_t time(time_t *t);
+```
+
+- 成功执行则返回从 UTC 1970 年 1 月 1 日开始至今的时间（单位为秒）并将结果存放到`t`中，失败则返回 -1 的强转`((time_t) -1)`并设置 errno
+
+```c
+#include <time.h>
+
+struct tm *gmtime(const time_t *timep);
+struct tm *gmtime_r(const time_t *timep, struct tm *result);
+
+struct tm *localtime(const time_t *timep);
+struct tm *localtime_r(const time_t *timep, struct tm *result);
+
+time_t mktime(struct tm *tm);
+```
+
+- `gmtime`按 UTC 时间将`time_t`时间戳转换为`tm`结构体，`localtime`则按本地时区转换
+- `mktime`按本地时区将`tm`结构体转换为`time_t`时间戳
+
+`tm`结构体定义如下
+
+```c
+struct tm {
+	int tm_sec;    /* Seconds (0-60) */
+    int tm_min;    /* Minutes (0-59) */
+    int tm_hour;   /* Hours (0-23) */
+    int tm_mday;   /* Day of the month (1-31) */
+    int tm_mon;    /* Month (0-11) */
+    int tm_year;   /* Year - 1900 */
+    int tm_wday;   /* Day of the week (0-6, Sunday = 0) */
+    int tm_yday;   /* Day in the year (0-365, 1 Jan = 0) */
+    int tm_isdst;  /* Daylight saving time */
+};
+```
+
+上面的时间信息依旧不够丰富，`strftime`函数可以按指定的格式化字符串来定制化生成时间信息
+
+```c
+#include <time.h>
+
+size_t strftime(char *s, size_t max, const char *format, const struct tm *tm);
+```
+
+- `s`：存放结果的缓冲区
+- `max`：缓冲区长度
+- `format`：格式化字符串，占位符如下
+  - ![time format](./img/time format.png)
+- `tm`：要解析的`tm`结构体
 
 ## 进程控制
 
