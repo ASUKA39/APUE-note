@@ -1005,20 +1005,20 @@ struct spwd *getspnam(const char *name);
 ```c
 struct spwd {
 	char *sp_namp;     /* Login name */
-    char *sp_pwdp;     /* Encrypted password */
-    long  sp_lstchg;   /* Date of last change
+	char *sp_pwdp;     /* Encrypted password */
+	long  sp_lstchg;   /* Date of last change
                           (measured in days since
                           1970-01-01 00:00:00 +0000 (UTC)) */
 	long  sp_min;      /* Min # of days between changes */
-    long  sp_max;      /* Max # of days between changes */
-    long  sp_warn;     /* # of days before password expires
+	long  sp_max;      /* Max # of days between changes */
+	long  sp_warn;     /* # of days before password expires
                           to warn user to change it */
-    long  sp_inact;    /* # of days after password expires
+	long  sp_inact;    /* # of days after password expires
                           until account is disabled */
-    long  sp_expire;   /* Date when account expires
+	long  sp_expire;   /* Date when account expires
                           (measured in days since
                           1970-01-01 00:00:00 +0000 (UTC)) */
-    unsigned long sp_flag;  /* Reserved */
+	unsigned long sp_flag;  /* Reserved */
 };
 ```
 
@@ -1084,14 +1084,14 @@ time_t mktime(struct tm *tm);
 ```c
 struct tm {
 	int tm_sec;    /* Seconds (0-60) */
-    int tm_min;    /* Minutes (0-59) */
-    int tm_hour;   /* Hours (0-23) */
-    int tm_mday;   /* Day of the month (1-31) */
-    int tm_mon;    /* Month (0-11) */
-    int tm_year;   /* Year - 1900 */
-    int tm_wday;   /* Day of the week (0-6, Sunday = 0) */
-    int tm_yday;   /* Day in the year (0-365, 1 Jan = 0) */
-    int tm_isdst;  /* Daylight saving time */
+	int tm_min;    /* Minutes (0-59) */
+	int tm_hour;   /* Hours (0-23) */
+	int tm_mday;   /* Day of the month (1-31) */
+	int tm_mon;    /* Month (0-11) */
+	int tm_year;   /* Year - 1900 */
+	int tm_wday;   /* Day of the week (0-6, Sunday = 0) */
+	int tm_yday;   /* Day in the year (0-365, 1 Jan = 0) */
+	int tm_isdst;  /* Daylight saving time */
 };
 ```
 
@@ -1108,6 +1108,199 @@ size_t strftime(char *s, size_t max, const char *format, const struct tm *tm);
 - `format`：格式化字符串，占位符如下
   - ![time format](./img/time format.png)
 - `tm`：要解析的`tm`结构体
+
+## 进程环境
+
+### 进程终止
+
+进程终止有多种可能的情形，在编码时都应该考虑完全
+
+- 正常终止
+  - 从`main`返回
+  - 调用`exit`
+  - 调用`_exit`或`_Exit`
+  - 最后一个线程从其启动例程返回
+  - 最后一个线程调用`pthread_exit`
+- 异常终止
+  - 调用`abort`
+  - 接到一个信号并终止
+  - 最后一个线程对取消请求做出响应
+
+进程结束时会将其`main`的返回值返回给其父进程。若父进程是 shell，程序的返回值可以使用`echo $?`查看
+
+关于程序退出的函数之间的关系如下
+
+![](./img/exit.png)
+
+- `_exit`和`_Exit`与`exit`的区别是前两者是系统函数，不会对进程资源做任何清理；而后者是系统函数的包装，会负责执行终止处理程序并释放进程资源
+
+程序可以注册至多 32 个终止处理程序（exit handler），`exit`函数被调用时就会去执行这些函数，终止处理程序的注册需要使用`atexit`
+
+```c
+#include <stdlib.h>
+
+int atexit(void (*function)(void));
+```
+
+- 当程序正常终止时`exit`会调用`atexit`注册的无参无返回值的函数，成功注册则返回 0，反之返回非零值
+
+### 命令行参数
+
+我们通常会在命令行中为程序传入选项，POSIX 定义了相关的解析函数来解析 POSIX 风格的命令行参数
+
+```c
+#include <unistd.h>
+
+int getopt(int argc, char * const argv[], const char *optstring);
+
+extern char *optarg;
+extern int optind, opterr, optopt;
+```
+
+- `getopt`：根据参数选项字符串`optstring`解析命令行参数，成功解析一个选项则返回该选项，解析到选项参数则返回 1，全部成功解析返回 -1，反之返回`?`
+  - `optsrting`格式规则：
+    - 单个字符表示该选项不需要额外参数
+    - 字符接一个冒号表示该选项需要一个参数，参数传入时可以与紧跟选项或以空格隔开，此参数的首地址将赋值给指针`optarg`
+    - 字符接两个冒号表示该选项的参数可选，若有参数则必须紧跟选项
+    - 举例：`ab:c`的合法命令行参数可以为`-a -b value -c`或`-ac -bvalue`
+  - 由于函数会遍历并返回解析到的字符，所以一般搭配循环和`switch`使用
+- `optarg`：指向选项参数的指针
+- `optind`：argv 当前索引值
+- `opterr`：无效选项信息，初始为 0
+- `optopt`：出现无效选项时为无效选项的索引值
+- 此外还有适合于解析长选项的函数`getopt_long`和`getopt_long_only`，这里不展开
+
+### 环境变量
+
+环境变量本质是一系列 kv 键值对，可以在 shell 中使用`export`命令查看系统环境变量，`env`命令查看当前用户环境变量，`echo $key`可以查看指定 key 的 value；`export key=value`或直接修改配置文件可以设置或添加环境变量，重新登陆或执行`source`命令使配置生效
+
+系统环境变量文件：
+
+- `/etc/profile`：系统的环境变量和启动脚本或程序，对所有用户生效
+- `/etc/profile.d/`：该目录下的脚本和程序会在用户登录时被执行
+- `/etc/bashrc`：对所有用户生效的 bash 环境变量文件
+
+用户环境变量文件处于 home 目录中，以 bash 为例：
+
+- `.bash_profile`：不一定默认存在，当用户登录时执行，每个用户都可以使用该文件来配置专属于自己的环境变量
+- `.bashrc`：当用户登录时以及每次打开新的 shell 时该文件将被读取，每开一个 shell 该文件都会被读取一次，可能影响效率
+- `.bash_logout`：当每次退出系统 shell 时执行该文件
+- `.bash_history`：保存了当前用户使用过的历史命令
+
+在程序执行时，环境变量位于栈区底部（高地址处）
+
+对每个程序而言，其都拥有一张字符指针形式的环境表，可以使用环境指针`extern char **environ`来访问环境表
+
+![environ](./img/environ.png)
+
+环境表相关函数
+
+```c
+#include <stdlib.h>
+
+char *getenv(const char *name);
+int setenv(const char *name, const char *value, int overwrite);
+int unsetenv(const char *name);
+
+extern char **environ;
+```
+
+- `getenv`：根据 key 来获取对应环境变量值
+- `setenv`：设置指定 key 的环境变量，若`overwrite`为 1 则表示修改现有的环境变量
+  - 原来的环境变量算是处于栈区，到程序执行时键值对长度已经固定，故若修改的新值比原值短则直接截断，比原值长则会在堆中申请一段内存用于存放新值，并修改环境表项指针指向这片内存
+- `unsetenv`：删除指定 key 的环境变量
+- `environ`：环境表指针，当做字符指针数组来使用就行
+
+### 共享库
+
+用于在运行时装卸、使用共享库
+
+```c
+#include <dlfcn.h>
+
+void *dlopen(const char *filename, int flags);
+int dlclose(void *handle);
+void *dlsym(void *handle, const char *symbol);
+char *dlerror(void);
+```
+
+- 编译时需要加上参数`-ldl`
+- `dlopen`：打开一个新共享库并加载进内存，返回一个`void`指针（称为 handle）
+  - ld.so 会去主动搜索`/lib`和`/usr/lib`
+  - `flags`是加载选项，比如`RT_LAZY`选项表示延迟加载直到库函数被调用
+- `dlclose`：卸载 handle 对应的共享库
+- `dlsym`：解析共享库中对应名字的函数地址并返回
+  - 由于返回值是`void`指针，而`void`指针强转是未定义行为，man 手册中特别提及以下两种用
+    - `(type (*)(arg_type)) dlsym(handle, "func_name")`：这种写法更直观，但涉及未定义行为（虽然已经写进新的 man 手册）
+    - `*(void **) (&func_ptr) = dlsym(handle, "func_name")`：这种写法不便于阅读，单能保证编译行为一致
+- `dlerror`：返回一个描述最后一次调用以上函数失败产生的错误信息的字符串
+
+### 递归跳转
+
+`goto`只能在同级过程间跳转，无法实现在递归中跳转，而有时可以通过直接跳出递归栈来优化程序（比如说树的递归查找）
+
+使用`setjmp`和`longjmp`可以实现从递归跳转
+
+```c
+#include <setjmp.h>
+
+int setjmp(jmp_buf env);
+void longjmp(jmp_buf env, int val);
+```
+
+- `setjmp`：在当前位置留下标记并记录在`jmp_buf`结构体`env`中，
+  - 这个函数执行一次，返回两次：第一次返回在设置标记时并返回 0，第二次返回在从其他地方跳转回来时并返回跳转函数带回的值
+  - `env`建议定义为全局变量
+- `longjmp`：跳转到标记`env`处，并带回整数值`val`；若`val`值为 0 函数会强制设置为 1 来规避死循环
+- 由于`setjmp`会返回两次，通常需要用`if`来判断这是首次执行还是跳转返回并控制执行分支
+
+### 进程资源获取和控制
+
+Linux 下对进程每种资源都有相关的软硬限制，软限制是内核强加给相应资源的限制值，硬限制是软限制的最大值
+
+非授权进程只能将其软限制指定为 0 到硬限制之间中的值，允许不可逆转地降低硬限制；授权进程（root）可以任意改变其软硬限制
+
+使用以下函数可以获取和更改资源限制值
+```c
+#include <sys/time.h>
+#include <sys/resource.h>
+
+int getrlimit(int resource, struct rlimit *rlim);
+int setrlimit(int resource, const struct rlimit *rlim);
+```
+
+`rlimit`结构体定义如下：
+
+```c
+struct rlimit {
+　　rlim_t rlim_cur;  /* Soft limit */
+　　rlim_t rlim_max;  /* Hard limit (ceiling for rlim_cur) */
+};
+```
+
+resource的选择有：
+
+- `RLIMIT_AS`：进程的最大虚拟内存空间大小，单位为字节
+- `RLIMIT_CORE`：内核转储（core dump）文件的最大长度
+- `RLIMIT_CPU`：最大允许的 CPU 使用时间，单位为秒，超过该时间时核心会给其发送`SIGXFSZ`信号，默认情况下将终止进程的执行
+- `RLIMIT_DATA`：进程数据段最大值
+- `RLIMIT_FSIZE`：进程可创建文件的最大长度，若进程试图超出这一限制时核心会给其发送`SIGXFSZ`信号，默认情况下将终止进程的执行
+- `RLIMIT_LOCKS`：进程可创建的锁的最大值
+- `RLIMIT_MEMLOCK`：进程可锁定在内存中的最大数据量，单位为字节
+- `RLIMIT_MSGQUEUE`：进程可为 POSIX 消息队列分配的最大字节数
+- `RLIMIT_NICE`：进程可通过`setpriority()` 或 `nice()`设置的最大 nice 值
+- `RLIMIT_NOFILE`：进程可打开的最大文件描述符数的开区间上限，若超出此值将会产生`EMFILE`错误
+- `RLIMIT_NPROC`：用户可拥有的最大进程数
+- `RLIMIT_RTPRIO`：进程可通过`sched_setscheduler` 和 `sched_setparam`设置的最大实时优先级
+- `RLIMIT_SIGPENDING`：用户可拥有的最大挂起信号数
+- `RLIMIT_STACK`：进程栈大小的最大值，单位为字节
+
+返回值：
+
+- 成功执行返回0。失败返回 -1，并设置 errno 为以下值：
+  - `EFAULT`：`rlim`指针指向的空间不可访问
+  - `EINVAL`：参数无效
+  - `EPERM`：无增加资源限制值权限
 
 ## 进程控制
 
