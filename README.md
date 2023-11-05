@@ -1304,7 +1304,368 @@ resource的选择有：
 
 ## 进程控制
 
+### 简介
+
+每个进程都有一个非负整型表示的唯一进程 ID（PID）。因为进程ID标识符总是唯一的，常将其用作其他标识符的一部分以保证其唯一性。例如，如 httpd 等程序希望其只有一个实例在运行，于是就把 PID 作为名字的一部分来创建文件锁作为单例进程已存在的标识，创建进程时首先检查此文件是否已经存在，在进程结束或异常退出时由系统删除
+
+进程标识符的类型为 pid_t，本质上是一个 unsigned int
+
+PID 是可复用的。当一个进程终止后，其 PID 就成为复用的候选者。大多数 UNIX 系统实现延迟复用算法，使得赋予新建进程的 ID 不同于最近终止进程所使用的 PID，防止将新进程误认为是使用同一 PID 的某个已终止的先前进程
+
+在 Linux 中，0 号进程是称为 idle 进程（也被称为 swapper 进程），此进程属于内核的一部分，是系统启动的第一个进程，启动完毕后只循环 hlt 指令，作用是在没有任务时使 CPU 空载
+
+1 号进程是 init 进程，是第一个用户进程（故而也是所有进程的祖先进程，但不是父进程），用于系统初始化与引导其他用户进程，在 Linux 中位于`/sbin/init`，同时它也负责回收所有孤儿进程
+
+使用`ps`命令可以查看当前系统有哪些进程及其详细信息
+
+- `-e`：显示所有进程
+- `-f`：全格式
+- `-l`：长格式
+- `a`：显示包括其他用户进程在内的终端上的所有进程
+- `r`：显示正在运行的进程
+- `x`：显示脱离终端的进程，比如守护进程
+
+### fork、vfork
+
+```c
+#include <unistd.h>
+
+pid_t fork(void);
+```
+
+- `fork`调用一次返回两次，对于子进程返回值为 0，对于父进程返回值为子进程的 PID，失败返回 -1 并设置 errno
+- `vfork`原有的功能是解决`fork`之后立即执行`exec`情境下复制父进程造成的资源浪费，调用`vfork`创建的子进程优先执行并与父进程共享内存空间，但随着写时复制（COW）技术的普及现已很少使用
+- `fork`之后执行父进程还是子进程由调度器决定，不可预测，不过可以使用`sleep`来让某个进程后执行
+- 父子进程执行`fork`之后的指令，子进程获得父进程堆栈、IO 缓冲区和文件描述符的副本（相当于执行了`dup`），另外，父子进程对同一文件共享文件偏移，此外子进程还继承父进程如用户 ID 、工作目录、资源限制、信号等很多内容，详见 APUE
+  - 由于子进程复制了父进程的 IO 缓冲，建议在`fork`之前先`fflush`掉缓冲区避免造成不必要的输出
+  - 考虑一个场景，如果不共享文件偏移，那么多进程下的标准输出或文件写入位置将会变得难以控制，所以此共享是必要的
+
+![fork](./img/fork.png)
+
+- 如果在循环中使用`fork`，需要注意子进程应当在执行完本轮循环后主动`exit`掉，否则子进程执行到下轮循环也会继续执行`fork`，最终造成资源溢出
+- 若在子进程退出前父进程先退出，那么其所有子进程将会变为孤儿进程，最终由 init 进程接管并收集返回状态
+- 若在子进程退出后父进程没有调用`wait`或`waitpid`收集子进程退出状态，那么子进程将的 PCB 以及部分资源将会被保留在系统中变为僵尸进程，PID 也同样被保留，这会造成进程分配资源的占用
+
+### wait、wait、pid
+
+```c
+#include <sys/types.h>
+#include <sys/wait.h>
+
+pid_t wait(int *status);
+pid_t waitpid(pid_t pid, int *status, int options);
+```
+
+- `wait`使进程阻塞，然后自动轮询子进程是否退出，若有子进程退出则将退出状态保存到`status`（若不想保存可以设置为 NULL）并恢复阻塞的父进程对退出状态进行处理，执行成功返回子进程 PID，无子进程返回 -1
+  - Linux 提供了很多宏函数对`status`进行布尔判定，这里仅举例
+    - `WIFEXITED(status)`：判断子进程是否为正常退出，是则返回非零
+    - `WEXITSTATUS(status)`：`WIFEXITED(status)`返回非零的情况下，可以用于提取子进程返回值
+- `waitpid`与`wait`基本一致，只多出两个参数
+  - `pid`：为合法 PID 时等待该子进程，等于 -1 时等待任意子进程，等于 0 时等待同进程组的任意子进程，小于 -1 等待 PID 为`pid`绝对值的进程组的任意子进程
+  - `option`为选项位图，常用选项`WNOHANG`意为转变函数为非阻塞
+  - `wait(&status)`等价于`wait(-1, &status, 0)`
+
+### exec 族
+
+UNIX 启动新进程的方式为先在本进程`fork`一个子进程，然后子进程紧接执行`exec`将此子进程转变为新进程
+
+```c
+#include <unistd.h>
+
+extern char **environ;
+
+int execl(const char *pathname, const char *arg, ... /* (char  *) NULL */);
+int execlp(const char *file, const char *arg, ... /* (char  *) NULL */);
+int execle(const char *pathname, const char *arg, ... /*, (char *) NULL, char *const envp[] */);
+int execv(const char *pathname, char *const argv[]);
+int execvp(const char *file, char *const argv[]);
+int execvpe(const char *file, char *const argv[], char *const envp[]);
+```
+
+- 执行成功不返回（此进程已被夺舍），失败返回 -1 并设置 errno
+- 新进程将继承原进程的各种 ID、工作路径、资源限制等
+- `argv[0]`建议设置为可执行文件名，这会影响各种命令的输出的进程名
+- 与`fork`相同，执行`exec`前注意先`fflush`掉 IO 缓冲，新进程不会继承原进程的缓冲区
+- 函数名后缀含义：
+  - `l`：list，即以数组方式传参
+  - `v`：vector，即以指针数组方式传参
+  - `p`：$PATH，即在环境变量`$PATH`中找对应文件名的文件
+  - `e`：envp，即在自己指定的环境变量`envp[]`中找目标文件，新进程将继承
+
+![exec](./img/exec.png)
+
+#### shell 外部命令实现
+
+内部命令指集成在 shell 内部的命令，本身属于 shell 的一部分；外部命令则是 Linux 提供的一系列程序，需要由 shell 起新进程来执行，比如 busybox 里的命令
+
+外部命令执行流程为：shell 首先 fork 一个子进程，在子进程里，在`$PATH`里所列出的目录中寻找特定的可执行文件，比如默认值`/bin:/usr/bin:/usr/X11R6/bin:/usr/local/bin`，当命令名称包含有左斜杠时略过路径查找，然后在子进程里 exec 此程序，父进程 shell 调用 wait 阻塞并等待回收子进程退出状态，执行完毕后重新回到等待用户输入命令的状态
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <glob.h>
+
+#define DELIMS " \t\n"
+
+struct cmd_st {
+    glob_t globres;
+};
+
+static void prompt(void) {
+    printf("mysh$ ");
+}
+
+static void parse(char *line, struct cmd_st *res) {
+    char *tok;
+    int i = 0;
+    while(1) {
+        // strsep 函数将缓冲区按换行符分割
+        tok = strsep(&line, DELIMS);
+        if(tok == NULL)
+            break;
+        if(tok[0] == '\0')
+            continue;
+       	// 利用 glob 函数的参数特点来模拟 argc 和 argv
+        // NOCHECK：不对 pattern 进行解析，直接返回 pattern（这里是 tok），相当于存储了命令行参数 tok 在 glob_t 中
+        // APPEND：以追加形式将 tok 存放在 glob_t 中，第一次时不追加，因为 globres 尚未初始化，需要系统来自己分配内存，因此乘上 i
+        glob(tok, GLOB_NOCHECK|GLOB_APPEND*i, NULL, &res->globres);
+        // 置为 1，使得追加永远成立
+        i = 1;
+    }
+}
+
+int main(void) {
+    char *linebuf = NULL;
+    size_t linebuf_size = 0;
+    struct cmd_st cmd;
+    pid_t pid;
+    while(1) {
+        prompt();
+        if(getline(&linebuf, &linebuf_size, stdin) < 0) {
+            break;
+        }
+
+        parse(linebuf, &cmd);
+        // 方便起见新增实现 exit 命令
+        if(strcmp(cmd.globres.gl_pathv[0], "exit") == 0) {
+            exit(0);
+        }
+        if(0) {
+            // 内部命令
+        }
+        else {
+            pid = fork();
+            if(pid < 0) {
+                perror("fork()");
+                exit(1);
+            }
+            if(pid == 0) {
+                execvp(cmd.globres.gl_pathv[0], cmd.globres.gl_pathv);
+                perror("execvp()");
+                exit(1);
+            } else {
+                wait(NULL);
+            }
+        }
+    }
+    exit(0);
+}
+```
+
+![mysh](./img/p1/mysh.png)
+
+### 用户权限、组权限
+
+Linux 采用一个 32 位整数记录和区分不同的用户。这个区分不同用户的数字被称为 UID。Linux 中用户分为三类：普通用户、root 用户和系统用户
+
+- 普通用户：指所有使用 Linux 的真实可登录的用户，UID < 65537，但通常 UID>500
+- root 用户：特权用户，UID 为 0
+- 系统用户：指后台进程和服务运行所必需的非 root 用户，这类用户不会登录，UID 随发行版不同，通常为 1~999
+
+内核在每个进程的 PCB 中维护了他们的三个 UID：
+
+- 真实用户 ID（Real UID，ruid）：标识一个进程启动时的用户 ID，简称 uid
+- 保存用户 ID（Saved UID，suid）：标识一个进程最初的有效用户 ID，用于在权限暂时变更后恢复原来的权限
+- 有效用户 ID（Effective UID，euid）：标识一个进程正在运行时所属的用户 ID，一个进程在运行途中是可以改变自己所属用户的，因而权限机制也是通过有效用户 ID 进行认证的
+
+文件和目录权限除了普通权限rwx外，还有三个特殊权限：
+
+- SUID：在属主的 x 位为 s 标识，普通用户在使用有 SUID 权限的文件或命令时会暂时获得该文件属主相等的权限，可以使用`chmod u+s`来为文件赋予此权限
+- SGID：在属组的 x 位为 s 标识，功能基本同上，可以使用`chmod g+s`来为文件赋予此权限
+- STIKCY：黏着位，以前章节讲过，可以使用`chmod o+t`来为文件或目录赋予此权限
+
+从权限变更角度来看 Linux 启动和运行：
+
+- Linux 系统产生第一个进程 init 进程，其三个 UID 为都为 0，故而拥有超级用户权限
+- init 进程`fork`和`exec`产生 getty 进程，此进程等待用户输入用户名
+- 用户输入了用户名后，getty 进程存储用户名，`exec`变为 login 进程等待用户输入密码并验证口令
+- 若验证成功，login 进程则`fork`并`exec`变为 shell 进程，即终端，进程权限变更为登录用户的 UID；如果验证失败则返回继续验证
+- 当用户执行某个命令时，shell 进程`fork`并`exec`该命令对应的程序
+
+相关函数
+
+获取 UID
+
+```c
+#include <unistd.h>
+#include <sys/types.h>
+
+uid_t getuid(void);
+uid_t geteuid(void);
+gid_t getgid(void);
+gid_t getegid(void);
+```
+
+设置 UID
+
+```c
+#include <sys/types.h>
+#include <unistd.h>
+
+int setuid(uid_t uid);
+int setgid(gid_t gid);
+```
+
+交换 UID
+
+```c
+#include <sys/types.h>
+#include <unistd.h>
+
+int setreuid(uid_t ruid, uid_t euid);
+int setregid(gid_t rgid, gid_t egid);
+```
+
+### system
+
+```c
+#include <stdlib.h>
+
+int system(const char *command);
+```
+
+- `system`等价于`/bin/sh -c command`，实际上就是对`fork`、`exec`、`wait`的封装
+
+### 守护进程、进程组与会话
+
+守护进程是一类特殊的后台进程，它们独立于控制终端并周期性地执行某些任务（如 httpd、sshd 等），由内核进行调度。守护进程常在系统启动伊始启动，于系统关闭时才退出
+
+进程组是一些进程的组合，每个进程除了 PID 外还会拥有一个进程组 ID，拥有同一个进程组 ID 的进程同属于一个进程组。每个进程组都有一个组长进程，进程组 ID 就是组长的 PID。当组长进程退出时会由同进程组的其他进程接替，进程组依旧保留直到最后一个进程退出。一个进程组内的进程通常都与一个作业相关联，也可以收到同一个信号，来自终端的信号可以使整个进程组中的进程停止、继续运行或终止
+
+会话由一个或多个进程组组合而成，同样每个会话都会有一个会话 ID（SID）。会话与终端密切相关，每打开一个终端或登入一个用户就会创建一个新会话，会话中允许的第一个进程称作会话的首进程（通常是 shell），通常而言会话终于终端的关闭或一个用户的退出，在此期间用户运行的所有进程都属于这个会话
+
+创建会话、守护进程
+
+```c
+#include <unistd.h>
+
+pid_t setsid(void);
+```
+
+- `setsid`创建一个新的会话，成功返回新会话的 ID，当前进程将作为新的会话组长，若当前进程已是会话组长时或其他情况执行失败并返回 -1 并设置 errno
+- 创建守护进程依赖于此函数，流程如下
+  - 于父进程中执行`fork`并由父进程执行`exit`退出，此时子进程变为孤儿进程由 init 进程接管
+  - 子进程调用`setsid`创建新会话和新进程组，由于前面子进程由 init 进程接管，故此时子进程一定不是组长进程
+  - （可选）第二次`fork`并`exit`，此时子进程 PID 不等于 SID，由于开启终端的必须是会话组长，这样可以确保进程一定无法通过`open("/dev/tty", flags)`来重新获取终端。不过这并非必须的，许多重要的守护进程其实都没有这样做
+  - 子进程调用`chdir`修改工作目录为根目录
+  - 子进程调用`umask`将自身 umask 修改为 0，也就是创建文件的基础权限为 0777，方便后续基于此继续修改权限
+  - 关闭所有不必要的文件描述符
+  - 打开空设备`/dev/null`，调用`dup2`将标准输入、标准输出和标准错误输出重定向到空设备
+  - 自此一个守护进程创建完成，后续只能通过`kill`来杀死此进程
+
+```c
+#include <iostream>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/stat.h>
+#include <cstdlib>
+#include <fcntl.h>
+
+void main(void) {
+    int fd;
+    pid_t pid;
+    
+    pid = fork();
+    if(pid < 0) {
+        perror("fork...");
+        exit(1);
+    }
+    else if(pid == 0) {
+        if(setsid() == -1) {
+            perror("setsid...");
+            exit(1);
+        }
+        
+        fd = open("/dev/null", O_RDWR);
+        if(fd < 0) {
+            perror("open...");
+            exit(1);
+        }
+        
+        dup2(fd, 0);
+        dup2(fd, 1);
+        dup2(fd, 2);
+        if(fd > 2) {
+            if(close(fd) == -1) {
+                perror("close...");
+                exit(1);
+            }
+        }
+        
+        chdir("/");
+        umask(0);
+        
+        for(;;) {
+            // deamon task
+        }
+    }
+    else if(pid > 0) {
+        exit(0);
+    }
+    
+    exit(0);
+}
+```
+
+在 shell 中在命令后加上`&`字符可以将进程置为后台进程，后台进程与终端密切相关，关闭终端时后台进程立即退出
+
+可以使用`nohup`命令配合`&`将后台进程转为守护进程，注意将原有的标准输出重定向到其他位置
+
+```shell
+nohup command [arg] &
+```
+
+有些守护进程需要锁定只允许一个实例运行，则可以创建锁文件进行锁定，文件位于`/var/run/[name].pid`，内容为当前实例的 PID，这样每次创建实例前只需读此锁文件就知道当前实例的 PID
+
+### 系统日志
+
+系统日志文件位于`/var/log`目录下，其中包括主日志文件`messages`。Linux 中提供了系统日志服务 syslogd，写系统日志只需调用其提供的接口
+
+```c
+#include <syslog.h>
+
+void openlog(const char *ident, int option, int facility);
+void syslog(int priority, const char *format, ...);
+void closelog(void);
+```
+
+- `openlog`：打开日志服务，也可以不显式调用而由`syslog`自动调用
+  - `ident`：表示一个信息来源，此信息会被写到每行日志之前
+  - `option`：日志选项位图，详细翻阅 man 手册
+  - `facility`：消息来源位图，详细翻阅 man 手册
+- `syslog`：发送一条日志信息
+  - `priority`：日志级别位图
+  - `format`及后续参数：格式化字符串，注意这里无需显式标明换行符，`syslog`本身会控制格式
+  - 日志可以发送到文件甚至网络中，默认写到`message`文件中，如需自定义则需要修改 syslogd 的配置文件
+- `closelog`，关闭系统日志，同样可以不显式调用
+
 ## 信号
+
+### 并发
+
+
 
 ## 线程
 
