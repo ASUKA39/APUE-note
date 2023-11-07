@@ -1663,9 +1663,405 @@ void closelog(void);
 
 ## 信号
 
-### 并发
+### 基本概念
 
+信号可以看作软件层面的中断（APUE 里说“信号就是软件中断”，但我认为这容易与软中断相混淆。虽然软中断和信号的设计有相似之处，但两者不是一个东西）
 
+进程与进程、内核与进程间可以通过调用`kill`函数来相互发送信号，shell 中使用`kill`命令也可以给某个进程发送信号（`kill`并不只用于杀死进程，只不过大部分信号的系统默认处理都会导致进程终止），支持的信号有下，详细介绍查看 APUE
+
+![](./img/signal.png)
+
+信号是典型的异步事件。当信号出现时，进程可以忽略信号、执行注册的 handler 或执行系统默认操作，收到某些信号而终止的进程还会生成一个核心转储（core dump）文件，此文件是进程终止时的内存映像备份，将此文件交给 gdb 可以用于调试错误原因
+
+此外，随着信号机制的补充，此前我们对异常退出和 errno 的认知需要做出一些改变，比如对于阻塞的系统调用（如`open`、`read`、`write`），当进程在慢设备的读写过程中收到中断，阻塞系统调用将会被打断并返回负数，但显然此时并非真正出现错误，故此时还需要判断 errno 是否为`EINTR`，即阻塞系统调用被中断打断，再进一步做出响应
+
+### signal
+
+`signal`函数可以用于信号处理方法的注册
+
+```c
+#include <signal.h>
+
+typedef void (*sighandler_t)(int);
+
+sighandler_t signal(int signum, sighandler_t handler);
+```
+
+- 成功执行返回旧值，失败则返回`SIG_ERR`
+- `signum`：信号编号，可以使用宏定义的信号名
+- `handler`：接收到此信号后要执行的操作
+  - `SIG_IGN`：忽略此信号
+  - `SIG_DFL`：系统默认操作
+  - 函数指针：执行此指定函数
+
+### 信号的响应
+
+信号处理程序的上下文由内核布置，若此时又出现另一个信号，内核将再次调用信号处理程序，这很可能会破坏上一个信号处理程序的上下文，故这种信号称为不可靠的信号
+
+为了避免这样的不可靠性，推荐编写可重入的处理函数。可重入指函数是纯函数实现的，固定输入固定输出，不受任何其他函数之外数据的影响（如不使用作用范围外的变量，不使用静态区、堆区，不使用标准 IO 函数，或使用互斥锁）。所有系统调用都是可重入的，在此前的学习中我们遇到的函数名带`_r`后缀的函数也是可重入的
+
+操作系统为每个进程都维护了一个信号掩码 mask（初始为全 1）和一个当前信号的位图 pending（初始为全 0）。当进程接收到一个信号时就设置位图对应位为 1、设置对应掩码位为 0，然后开始处理信号，处理完毕后恢复掩码并还原位图。此过程中，若有多个不同信号来临，处理顺序由高优先度到低优先度排序，同优先度乱序执行；若有一个信号来临多次则会由于位图置一操作的幂等性而发生信号的丢失，只会响应最后一次信号。信号的屏蔽是通过将掩码对应的位置置零来实现的
+
+进程在接收到信号时并不会第一时间观察并做出响应，实际上，信号的处理发生在进程被中断、即将从内核态返回用户态的过程中，此时内核会观察信号位图并临时转向从内核态返回到信号处理函数，执行完毕后回到内核态并继续这一过程，直到所有信号均被处理，最后返回到程序本身。由于这种机制，信号的处理必然会出现一定的延迟
+
+### kill、raise、alarm、pause
+
+`kill`函数用于给指定进程发送信号
+
+```c
+#include <sys/types.h>
+#include <signal.h>
+
+int kill(pid_t pid, int sig);
+```
+
+- `pid`：要发送信号的进程
+  - 大于 0：即发送给此 PID 的进程
+  - 等于 0：发送给同进程组的所有进程，即组内广播
+  - 小于 -1：发送给绝对值对应 ID 的进程组内的所有进程
+  - 等于 -1：发送给本进程有权限发送的所有进程
+- `sig`：要发送的信号，为 0 时不发送信号，但是会返回 -1 并设置 errno，通常用于检测进程或进程组是否存在，对应的 errno 如下
+  - `EINVAL`：无效信号
+  - `EPERM`：当前进程无权限给目标进程发送信号
+  - `ESRCH`：无此进程或进程组
+
+```c
+#include <signal.h>
+
+int raise(int sig);
+```
+
+- `raise`函数用于给自己发送信号，等价于`kill(getpid(), sig);`
+
+```c
+#include <unistd.h>
+
+unsigned int alarm(unsigned int seconds);
+```
+
+- `alarm`函数可作为一个定时器，返回值为 0 或剩余秒数
+- 到达指定秒数后内核向进发送`SIGALRM`信号，此信号默认操作为终止进程
+- 每个进程有唯一的计时器，进程调用多个`alarm`时会造成计时器的覆盖，`seconds`为 0 时取消计时器
+
+```c
+#include <unistd.h>
+
+int pause(void);
+```
+
+- `pause`函数用于将函数阻塞挂起并放弃 CPU（比如 x86 下的 HALT 状态），直到信号来临
+
+`alarm + pause`的组合可以实现`sleep`的效果，但和`sleep`的不同之处在于`sleep`在不同平台下的实现不同，计时非常不稳定不精确，`alarm + pause`的迁移性好且较为稳定精确，推荐使用
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <signal.h>
+
+static volatile int loop = 1;
+
+static void alrm_handler(int s) {
+    loop = 0;
+}
+
+int main(void) {
+    int64_t count = 0;
+
+    signal(SIGALRM, alrm_handler);
+    alarm(5);
+    while(loop)
+        count++;
+    printf("%lld\n", count);
+    
+    exit(0);
+}
+```
+
+- 注意这里需要给`loop`加上关键字`volatile`避免过度编译优化，由于编译器很难理解基于信号的程序的控制流，所以往往会将这样的循环当做死循环而造成过度优化
+
+### 漏桶、令牌桶及其实现
+
+漏桶和令牌桶常用于流量控制、流量整形
+
+漏桶的设计形似与沙漏，其可以承载大量输入，但始终按固定速度输出，适合于限制流量，均衡负载
+
+令牌桶在漏桶的设计上多加了一层：控制进程持在桶中存放令牌，并按固定速度向桶中添加令牌，桶满则丢弃多余令牌；其他进程的请求到来时向桶申请若干令牌，拿到足够令牌才能继续进行若干操作，这样的设计适合于处理具有突发特性的流量
+
+以下代码实现了一个简单的令牌桶库，允许调用者申请多个不同速率、不同容量的令牌桶，并综合考虑了对`SIGALRM`信号处理的透明设计以及进程的异常退出处理
+
+```c
+#ifndef MYTBF_H__
+#define MYTBF_H__
+
+#define MYTBF_MAX 1024
+
+typedef void mytbf_t;
+
+mytbf_t *mytbf_init(int cps, int burst);
+int mytbf_fetchtoken(mytbf_t *, int);
+int mytbf_returntoken(mytbf_t *, int);
+int mytbf_destroy(mytbf_t *);
+
+#endif
+```
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <signal.h>
+#include <unistd.h>
+#include <sys/time.h>
+
+#include "mytbf.h"
+
+typedef void (*sighandler_t)(int);
+
+struct mytbf_st
+{
+    int cps;
+    int burst;
+    int token;
+    int pos;
+};
+
+static struct mytbf_st *job[MYTBF_MAX];     // job array
+static volatile int inited = 0;             // init flag
+static sighandler_t alrm_handler_save;      // save old signal handler, for recover if exit
+
+static void alrm_handler(int s)             // first called by alarm in module_load(), then called by alarm in itself every one second
+{
+    int i;
+
+    alarm(1);                               // one second per alarm, it constructs a loop in fact
+    for(i = 0; i < MYTBF_MAX; i++)
+    {
+        if(job[i] != NULL)                  // if job exist, add token for all jobs
+        {
+            job[i]->token += job[i]->cps;
+            if(job[i]->token > job[i]->burst)
+                job[i]->token = job[i]->burst;
+        }
+    }
+}
+
+static void module_unload(void)             // if exit, recover old signal handler, cancel alarm and free all jobs
+{
+    int i;
+
+    signal(SIGALRM, alrm_handler_save);     // recover old signal handler
+    alarm(0);                               // cancel alarm
+    for(i = 0; i < MYTBF_MAX; i++)
+        free(job[i]);                       // free all jobs
+}
+
+static void module_load(void)
+{
+    alrm_handler_save = signal(SIGALRM, alrm_handler);  // save old signal handler, and set new signal handler
+    alarm(1);                                           // set alarm, then call handler after one second
+    atexit(module_unload);                              // set exit hook function
+}
+
+static int get_free_pos(void)
+{
+    int i;
+
+    for(i = 0; i < MYTBF_MAX; i++)
+    {
+        if(job[i] == NULL)
+            return i;
+    }
+
+    return -1;
+}
+
+mytbf_t *mytbf_init(int cps, int burst)
+{
+    struct mytbf_st *me;
+    int pos;
+
+    if(!inited)
+    {
+        module_load();
+        inited = 1;
+    }
+    
+    pos = get_free_pos();
+    if(pos < 0)
+        return NULL;
+
+    me = malloc(sizeof(*me));               // malloc memory for single job
+    if(me == NULL)
+        return NULL;
+
+    me->token = 0;
+    me->cps = cps;
+    me->burst = burst;
+    me->pos = pos;
+    job[pos] = me;
+
+    return me;
+}
+
+static int min(int a, int b)
+{
+    if(a < b)
+        return a;
+    return b;
+}
+
+int mytbf_fetchtoken(mytbf_t *ptr, int size)
+{
+    struct mytbf_st *me = ptr;
+    int n;
+
+    if(size <= 0)
+        return -EINVAL;                     // invalid argument
+
+    while(me->token <= 0)
+        pause();
+
+    n = min(me->token, size);               // if token is not enough, return all token
+    me->token -= n;                         // purchase token
+
+    return n;
+}
+
+int mytbf_returntoken(mytbf_t *ptr, int size)
+{
+    struct mytbf_st *me = ptr;
+
+    if(size <= 0)
+        return -EINVAL;
+
+    me->token += size;
+    if(me->token > me->burst)
+        me->token = me->burst;
+
+    return size;
+}
+
+int mytbf_destroy(mytbf_t *ptr)
+{
+    struct mytbf_st *me = ptr;
+
+    job[me->pos] = NULL;
+    free(ptr);
+
+    return 0;
+}
+```
+
+基于此令牌桶库，这里还给出一个按某种速率输出的`cat`命令的简单实现，将单次输出的字符数抽象为令牌，从而限制输出速率
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <string.h>
+#include <signal.h>
+
+#include "mytbf.h"
+
+static const int SIZE = 1024;   // buffer size
+static const int CPS = 10;      // token release rate
+static const int BURST = 100;   // token max
+
+static volatile int token = 0;
+
+int main(int argc, char** argv)
+{
+    if (argc < 2)
+    {
+        fprintf(stdout, "Usage...");
+        exit(1);
+    }
+
+    mytbf_t *tbf;
+
+    tbf = mytbf_init(CPS, BURST);   // init token bucket
+    if (tbf == NULL)
+    {
+        fprintf(stderr, "tbf init error");
+        exit(1);
+    }
+
+    int sfd, dfd = 0;
+    do
+    {
+        sfd = open(argv[1], O_RDONLY);
+        if (sfd < 0)
+        {
+            if (errno == EINTR)     // if interrupted by signal, continue
+                continue;
+            fprintf(stderr, "%s\n", strerror(errno));
+            exit(1);
+        }
+    }while(sfd < 0);
+
+    char buf[SIZE];
+    
+    while(1)
+    {
+        int len, ret, pos = 0;
+        int size = mytbf_fetchtoken(tbf, SIZE);     // try to get SIZE tokens; if tokens not enough, get all existing tokens; if no token, block
+
+        if (size < 0){
+            fprintf(stderr, "mytbf_fetchtoken()%s\n", strerror(-size));
+            exit(1);
+        }
+
+        len = read(sfd, buf, size);
+        while (len < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            strerror(errno);
+            break;
+        }
+
+        if (len == 0)
+            break;
+
+        if (size - len > 0)
+        {
+            mytbf_returntoken(tbf, size-len);
+        }
+
+        while(len > 0)
+        {
+            ret = write(dfd, buf+pos, len);
+            while (ret < 0)
+            {
+                if (errno == EINTR)
+                    continue;
+                printf("%s\n", strerror(errno));
+                exit(1);
+            }
+
+            pos += ret;
+            len -= ret;
+        }
+    }
+
+    close(sfd);
+    mytbf_destroy(tbf);
+
+    exit(0);
+}
+```
+
+```shell
+gcc -o mycat ./mytbf.c ./mycat.c
+```
+
+![](./img/mytbf.png)
+
+### 信号集
 
 ## 线程
 
