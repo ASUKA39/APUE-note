@@ -1346,7 +1346,7 @@ pid_t fork(void);
 - 若在子进程退出前父进程先退出，那么其所有子进程将会变为孤儿进程，最终由 init 进程接管并收集返回状态
 - 若在子进程退出后父进程没有调用`wait`或`waitpid`收集子进程退出状态，那么子进程将的 PCB 以及部分资源将会被保留在系统中变为僵尸进程，PID 也同样被保留，这会造成进程分配资源的占用
 
-### wait、wait、pid
+### wait、waitpid
 
 ```c
 #include <sys/types.h>
@@ -1700,9 +1700,33 @@ sighandler_t signal(int signum, sighandler_t handler);
 
 为了避免这样的不可靠性，推荐编写可重入的处理函数。可重入指函数是纯函数实现的，固定输入固定输出，不受任何其他函数之外数据的影响（如不使用作用范围外的变量，不使用静态区、堆区，不使用标准 IO 函数，或使用互斥锁）。所有系统调用都是可重入的，在此前的学习中我们遇到的函数名带`_r`后缀的函数也是可重入的
 
-操作系统为每个进程都维护了一个信号掩码 mask（初始为全 1）和一个当前信号的位图 pending（初始为全 0）。当进程接收到一个信号时就设置位图对应位为 1、设置对应掩码位为 0，然后开始处理信号，处理完毕后恢复掩码并还原位图。此过程中，若有多个不同信号来临，处理顺序由高优先度到低优先度排序，同优先度乱序执行；若有一个信号来临多次则会由于位图置一操作的幂等性而发生信号的丢失，只会响应最后一次信号。信号的屏蔽是通过将掩码对应的位置置零来实现的
+Linux 在`task_struct`中为每个进程都维护了一个阻塞信号集 mask（可以想成初始为全 1）和一个未决信号集 pending（可以想成初始为全 0）。信号的屏蔽是通过将掩码对应的位置置零来实现的。当进程接收到一个信号时就设置位图对应位为 1、设置对应掩码位为 0，然后开始处理信号，处理完毕后恢复掩码并还原位图。此过程中，若有多个不同信号来临，处理顺序由高优先度到低优先度排序，同优先度乱序执行；若有一个非实时信号来临多次则会由于位图置一操作的幂等性而发生信号的丢失，只会响应最后一次信号；但如果此信号是实时信号，那么重复到来的信号将加入队列并依次被响应，这也是实时信号与普通信号的主要区别
+
+> 具体而言，`task_struct`中有以下成员
+>
+> ```c
+> ...
+> /* Signal handlers: */
+> 	struct signal_struct		*signal;
+> 	struct sighand_struct __rcu		*sighand;
+> 	sigset_t			blocked;
+> 	sigset_t			real_blocked;
+> 	/* Restored if set_restore_sigmask() was used: */
+> 	sigset_t			saved_sigmask;
+> 	struct sigpending		pending;
+> ...
+> ```
+>
+> - `*signal`记录进程的信号总体信息
+> - `*sighand`类型为`sighand_struct`，包含了一个`k_sigaction`结构体数组，其中的`sigaction`结构体会记录信号处理函数
+> - `blocked`是进程阻塞的信号掩码
+> - `real_blocked`是临时的阻塞信号掩码
+> - `saved_sigmask`是在中断或处理程序中保存下来的信号掩码
+> - `pending`类型为`sigpending`，是进程的信号队列
 
 进程在接收到信号时并不会第一时间观察并做出响应，实际上，信号的处理发生在进程被中断、即将从内核态返回用户态的过程中，此时内核会观察信号位图并临时转向从内核态返回到信号处理函数，执行完毕后回到内核态并继续这一过程，直到所有信号均被处理，最后返回到程序本身。由于这种机制，信号的处理必然会出现一定的延迟
+
+![signal inter](./img/signal inter.png)
 
 ### kill、raise、alarm、pause
 
@@ -2063,7 +2087,614 @@ gcc -o mycat ./mytbf.c ./mycat.c
 
 ### 信号集
 
+信号集类型`sigset_t`可以用于表示多个信号，本质即为一个`int`类型的位图
+
+```c
+#include <signal.h>
+
+int sigemptyset(sigset_t *set);
+int sigfillset(sigset_t *set);
+int sigaddset(sigset_t *set, int signum);
+int sigdelset(sigset_t *set, int signum);
+int sigismember(const sigset_t *set, int signum);
+```
+
+- 从以上函数命名即可看出功能分别对应：清空、填满、添加信号、删除信号以及检查信号是否存在与信号集
+
+### sigpromask、sigpending
+
+```c
+#include <signal.h>
+
+int sigprocmask(int how, const sigset_t *set, sigset_t *oldset);
+```
+
+- `sigprocmask`函数可以检测、更改阻塞信号集
+- `how`：信号修改方式
+  - `SIG_BLOCK`：求当前进程信号屏蔽字与参数`set`的并集，即屏蔽新信号
+  - `SIG_UNBLOCK`：求当前进程信号屏蔽字与参数`set`的交集，即取消屏蔽指定信号
+  - `SIG_SETMASK`：将屏蔽字设置为`set`
+- `oldset`：将旧的屏蔽字保存到这里，若不需要可以设置为 NULL
+
+```c
+#include <signal.h>
+
+int sigpending(sigset_t *set);
+```
+
+- 将进程当前的未决信号集 pending 保存到`set`
+- 比较不常用
+
+### sigsuspend、sigaction
+
+```c
+#include <signal.h>
+
+int sigsuspend(const sigset_t *mask);
+```
+
+- 将进程的信号屏蔽字替换为`mask`，然后阻塞进程
+- 和`sigprocmask + pause`组合功能基本相同，不同之处在于`sigsuspend`是一个原子操作，而前者无法保证执行过程中间收到信号的有效处理
+
+```c
+#include <signal.h>
+
+int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact);
+```
+
+- `sigaction`是加强版的`signal`，支持检查、修改、处理信号等更丰富的处理方式，一般来说如果使用`signal` gcc 会建议改为使用`sigaction`
+  - `signum`：要 hook 的信号
+  - `act`：指定信号处理方式
+  - `oldset`：用于保存旧的信号处理方式，可以设置为 NULL
+
+`sigaction`结构体定义如下
+
+```c
+struct sigaction {
+    void (*sa_handler)(int);
+    void (*sa_sigaction)(int, siginfo_t *, void *);
+    sigset_t sa_mask;
+    int sa_flags;
+    void (*sa_restorer)(void);
+}
+```
+
+- `sa_handler`：信号处理函数，与`signal`的一样
+- `sa_mask`：处理信号时要暂时屏蔽的信号
+- `sa_flags`：信号处理的选项
+  - `SA_RESETHAND`：当调用信号处理函数时，将信号的处理函数重置为缺省值`SIG_DFL`
+  - `SA_RESTART`：如果信号中断了进程的某个系统调用，则系统自动启动该系统调用
+  - `SA_NODEFER` ：一般情况下对于非实时信号，当信号处理函数运行时内核将屏蔽同样的信号，`SA_NODEFER`指定在处理信号时内核不再进行屏蔽
+  - `SA_SIGINFO`：无此选项则使用`sa_handler`，有则配合`sa_sigaction`使用，用以处理更多信息
+- `sa_sigaction`：若设置了`SA_SIGINFO`，则会使用此函数，否则使用sa_handler处理函数，参数`siginfo_t`结构体存储此信号的许多信息，具体如下
+
+```c
+struct siginfo_t {
+    int      si_signo;     /* Signal number */
+    int      si_errno;     /* An errno value */
+    int      si_code;      /* Signal code */
+    int      si_trapno;    /* Trap number that caused
+                              hardware-generated signal
+                              (unused on most architectures) */
+    pid_t    si_pid;       /* Sending process ID */
+    uid_t    si_uid;       /* Real user ID of sending process */
+    int      si_status;    /* Exit value or signal */
+    clock_t  si_utime;     /* User time consumed */
+    clock_t  si_stime;     /* System time consumed */
+    sigval_t si_value;     /* Signal value */
+    int      si_int;       /* POSIX.1b signal */
+    void    *si_ptr;       /* POSIX.1b signal */
+    int      si_overrun;   /* Timer overrun count;
+                              POSIX.1b timers */
+    int      si_timerid;   /* Timer ID; POSIX.1b timers */
+    void    *si_addr;      /* Memory location which caused fault */
+    long     si_band;      /* Band event (was int in
+                              glibc 2.3.2 and earlier) */
+    int      si_fd;        /* File descriptor */
+    short    si_addr_lsb;  /* Least significant bit of address
+                              (since Linux 2.6.32) */
+    void    *si_lower;     /* Lower bound when address violation
+                              occurred (since Linux 3.19) */
+    void    *si_upper;     /* Upper bound when address violation
+                              occurred (since Linux 3.19) */
+    int      si_pkey;      /* Protection key on PTE that caused
+                              fault (since Linux 4.6) */
+    void    *si_call_addr; /* Address of system call instruction
+                              (since Linux 3.5) */
+    int      si_syscall;   /* Number of attempted system call
+                              (since Linux 3.5) */
+    unsigned int si_arch;  /* Architecture of attempted system call
+                              (since Linux 3.5) */
+};
+```
+
 ## 线程
+
+### 简介
+
+线程本质上就是一个运行的函数，多核处理器下操作系统可以将多个线程调度到不同的 CPU 中实现并行加速
+
+线程拥有独立的栈，不过这个栈是在进程的栈中划分出来的小块，所以线程之间的栈实际上并未严格隔离，靠指针还是能进行互访，而且 32 位系统下创建太多线程容易爆栈；进程内存空间内的其他内容都是共享的，包括堆，不过 glibc 当前采用的堆管理器 ptmalloc 支持多线程并发，多个线程之间共享同样的 arena 和 free list
+
+#### POSIX 线程接口
+
+POSIX 线程即 pthread，这是一套线程标准而非具体实现，提供一套通用的线程 API，涵盖如下功能
+
+- 线程管理：如创建线程、等待线程、查询状态等
+- 互斥量：如创建互斥锁、销毁互斥锁、加锁、解锁、设置属性等
+- 条件变量：如创建条件变量、销毁条件变量、等待、通知、设置、查询等
+
+编译时需要在 makefile 加上选项
+
+```makefile
+CFLAGS+=-pthread
+LDFLAGS+=-pthread
+```
+
+- 不过亲测用 gcc 进行默认编译时不用显式地进行设置
+
+后面要讲的都基于 pthread 标准
+
+#### 线程与进程
+
+我的理解：进程是线程的容器，进程为线程提供资源环境，线程是进程的运行时，一个进程至少拥有一个线程
+
+Linux 中将线程处理为轻量级的进程，创建线程一样是通过调用`fork`实现的，且线程间依旧由内核的调度器调度，但线程之间共享地址空间和进程资源，且其本身拥有独立的 PCB，故拥有独立的 PID，并且其 PID 就是其 TID
+
+关于 Linux 中线程的表示和实现还需要查询一些资料，这里不展开叙述
+
+#### 线程标识
+
+线程的 ID 用`pthread_t`类型表示，比较特殊的是如果考虑移植性的话不能将其当做 int 类型
+
+获取线程自身的 ID 可以使用函数`pthread_self`
+
+```c
+#include <pthread.h>
+
+pthread_t pthread_self(void);
+```
+
+#### 线程私有空间
+
+gcc 内置的关键字`__thread`可以使一个变量（比如全局变量）在每个线程中都有一份独立的拷贝，线程修改此变量不会影响其他线程
+
+此外，pthread 还提供了一套函数用于管理线程的私有数据
+
+```c
+#include <pthread.h>
+
+pthread_key_t key;
+
+int pthread_key_create(pthread_key_t *key, void (*destr_function)(void *));
+int pthread_setspecific(pthread_key_t  key, void *pointer);
+void *pthread_getspecific(pthread_key_t key);
+int pthread_key_delete(pthread_key_t key);
+```
+
+- `pthread_key_create`：设置`key`的析构函数`destr_function`，可以设置为 NULL
+- `pthread_setspecific`：为`key`写入`pointer`指向的数据
+- `pthread_getspecific`：读取`key`
+- `pthread_key_delete`：销毁`key`
+
+### 线程创建
+
+```c
+#include <pthread.h>
+
+pthread_t thread;
+
+int pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start_routine) (void *), void *arg);
+```
+
+- `thread`：事先创建的`pthread_t`类型变量，用于存储线程 ID
+- `attr`：线程属性
+- `start_routine`：线程将要执行的函数
+- `arg`：函数参数，需要传入多个参数是应当使用结构体传参
+
+线程的调度取决于内核中的调度器，所以有可能主线程更早退出，主线程退出后其他线程也会一并退出
+
+### 线程终止
+
+如果任意线程调用了`exit`，那么整个进程都会终止，所以不应该像多进程一样使用`exit`退出线程
+
+线程有三种退出方式
+
+- 直接返回，返回值是退出码
+- 被其他线程取消
+- 主动调用`pthread_exit`退出
+
+```c
+#include <pthread.h>
+
+void pthread_exit(void *rval_ptr);
+```
+
+- `rval_ptr`：指向任意类型的数据作为返回值（void 指针可以指向任意类型的数据）
+
+与进程的`wait`一样，可以等待一个线程的退出实现同步
+
+```c
+#include <pthread.h>
+
+int pthread_join(pthread_t thread, void **retval);
+```
+
+- 等待线程`thread`终止，返回值存储在`rval_ptr`
+
+线程退出时可以指定析构函数，比较强大的是可以以栈的方式指定多个析构函数及其执行顺序
+
+```c
+#include <pthread.h>
+
+void pthread_cleanup_push(void (*routine)(void *), void *arg);
+void pthread_cleanup_pop(int execute);
+```
+
+- `push`：压入一个析构函数`routine`，参数是`arg`
+- `pop`：`execute`为 1 时使对应顺序的函数生效，为 0 时使之无效
+- 注意，这两个函数实际上是由宏来实习的，并且`push`展开后包含`{`，`pop`展开后包含`}`，故`push`和`pop`之间可以包含任意代码，但要求必须成对出现，否则会报错花括号未闭合
+
+线程之间还可以借助函数取消某个线程
+
+```c
+#include <pthread.h>
+
+int pthread_cancel(pthread_t thread);
+int pthread_setcancelstate(int state, int *oldstate);
+int pthread_setcanceltype(int type, int *oldtype);
+void pthread_testcancel(void);
+```
+
+- `pthread_cancel`：发送取消信号给指定线程
+- `pthread_setcancelstate`：设置此线程是否允许取消
+- `pthread_setcanceltype`：设置取消的方式，比如异步、推迟、推迟到取消点
+- `pthread_testcancel`：在本位置设置一个取消点
+- 线程在接收到取消信号时并不都会立即取消，还取决于线程本身是否允许取消以及线程自身的取消设置
+
+除了上面的功能外，线程本身还支持从主线程分离和阻塞某个线程
+
+```c
+#include <pthread.h>
+
+int pthread_join(pthread_t tid, void ** pthread_return);
+int pthread_detach(pthread_t thread);
+```
+
+- `pthread_join`：阻塞某个线程直到本线程结束
+- `pthread_detach`：分离指定线程，此线程退出后自动释放资源而不会造成其他线程的阻塞
+- 这两个函数在某些性能需求高的场景或嵌入式设备中会被使用
+
+### 互斥量
+
+创建、初始化、销毁互斥量
+
+```c
+#include <pthread.h>
+
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+
+int pthread_mutex_init(pthread_mutex_t *restrict mutex, const pthread_mutexattr_t *restrict attr);
+int pthread_mutex_destroy(pthread_mutex_t *mutex);
+```
+
+加锁、非阻塞加锁、解锁
+
+```c
+#include <pthread.h>
+
+int pthread_mutex_lock(pthread_mutex_t *mutex);
+int pthread_mutex_trylock(pthread_mutex_t *mutex);
+int pthread_mutex_unlock(pthread_mutex_t *mutex);
+```
+
+下面给出之前的令牌桶的多线程支持版本
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <signal.h>
+#include <unistd.h>
+#include <sys/time.h>
+#include <pthread.h>
+#include <string.h>
+
+#include "mytbf.h"
+
+struct mytbf_st
+{
+    int cps;
+    int burst;
+    int token;
+    int pos;
+    pthread_mutex_t mut;
+};
+
+static struct mytbf_st *job[MYTBF_MAX];
+static pthread_mutex_t mut_job = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t tid_alrm;                                  // used for alarm thread
+static pthread_once_t init_once = PTHREAD_ONCE_INIT;        // used for init once
+static volatile int inited = 0;
+
+static void *thr_alrm(void *p)                              // alarm thread, called by pthread_create
+{
+    int i;
+
+    while(1)
+    {
+        pthread_mutex_lock(&mut_job);                       // lock the job array
+        for(i = 0; i < MYTBF_MAX; i++)
+        {
+            if(job[i] != NULL)
+            {
+                pthread_mutex_lock(&job[i]->mut);           // lock the job[i]
+                job[i]->token += job[i]->cps;
+                if(job[i]->token > job[i]->burst)
+                    job[i]->token = job[i]->burst;
+                pthread_mutex_unlock(&job[i]->mut);
+            }
+        }
+        pthread_mutex_unlock(&mut_job);
+        sleep(1);
+    }
+}
+
+static void module_unload(void)
+{
+    int i;
+
+    pthread_cancel(tid_alrm);                               // cancel the alarm thread
+    pthread_join(tid_alrm, NULL);                           // wait for the alarm thread to exit
+    for(i = 0; i < MYTBF_MAX; i++)
+    {
+        if(job[i] != NULL)
+        {
+            pthread_mutex_destroy(&job[i]->mut);
+            free(job[i]);
+        }
+    }
+    pthread_mutex_destroy(&mut_job);
+}
+
+static void module_load(void)
+{
+    pthread_t tid_alrm;
+    int err;
+    pthread_create(&tid_alrm, NULL, thr_alrm, NULL);        // create the alarm thread
+    if(err)
+    {
+        fprintf(stderr, "pthread_create(): %s\n", strerror(err));
+        exit(1);
+    }
+    
+    atexit(module_unload);
+}
+
+static int get_free_pos_unlocked(void)                      // unlocked version of get_free_pos, plz lock the mut_job before calling this function
+{
+    int i;
+
+    for(i = 0; i < MYTBF_MAX; i++)
+    {
+        if(job[i] == NULL)
+            return i;
+    }
+    return -1;
+}
+
+mytbf_t *mytbf_init(int cps, int burst)                     // called by user
+{
+    struct mytbf_st *me;
+    int pos;
+
+    pthread_once(&init_once, module_load);                  // init the module once
+    
+    me = malloc(sizeof(*me));
+    if(me == NULL)
+        return NULL;
+    me->token = 0;
+    me->cps = cps;
+    me->burst = burst;
+    pthread_mutex_init(&me->mut, NULL);                     // init the mutex of me
+
+    pthread_mutex_lock(&mut_job);
+    pos = get_free_pos_unlocked();
+    if(pos < 0){
+        pthread_mutex_unlock(&mut_job);
+        free(me);
+        return NULL;
+    }
+    me->pos = pos;
+    job[pos] = me;
+    pthread_mutex_unlock(&mut_job);
+
+    return me;
+}
+
+static int min(int a, int b)
+{
+    if(a < b)
+        return a;
+    return b;
+}
+
+int mytbf_fetchtoken(mytbf_t *ptr, int size)
+{
+    struct mytbf_st *me = ptr;
+    int n;
+
+    if(size <= 0)
+        return -EINVAL;
+
+    pthread_mutex_lock(&me->mut);
+    while(me->token <= 0)
+    {
+        pthread_mutex_unlock(&me->mut);
+        sched_yield();                                      // wait for the token from alarm thread
+        pthread_mutex_lock(&me->mut);
+    }
+
+    n = min(me->token, size);
+    me->token -= n;
+    pthread_mutex_unlock(&me->mut);
+
+    return n;
+}
+
+int mytbf_returntoken(mytbf_t *ptr, int size)
+{
+    struct mytbf_st *me = ptr;
+
+    if(size <= 0)
+        return -EINVAL;
+
+    pthread_mutex_lock(&me->mut);
+    me->token += size;
+    if(me->token > me->burst)
+        me->token = me->burst;
+    pthread_mutex_unlock(&me->mut);
+
+    return size;
+}
+
+int mytbf_destroy(mytbf_t *ptr)
+{
+    struct mytbf_st *me = ptr;
+    
+    pthread_mutex_lock(&mut_job);
+    job[me->pos] = NULL;
+    pthread_mutex_unlock(&mut_job);
+    pthread_mutex_destroy(&me->mut);
+    free(ptr);
+
+    return 0;
+}
+```
+
+对于加锁解锁时机的判断，一个经验是操作变量时先想其是否是共享的、是否会造成读写冲突；在临界区内找到所有可能跳出临界区的位置并在其中对锁进行处理，这样能减少竞争和死锁的发生
+
+### 线程池
+
+线程池是为了解决管理线程数量、减少线程调度代价而诞生的，其设计类似于之前的令牌桶，管理线程发布任务和资源，其他工作线程长期存在，负责等待工作发布或领取工作并执行，这样避免了每出现一个任务就创建一个线程资源浪费，同时也减少了线程频繁创建带来的性能开销
+
+下面是一个简单的线程池的实现，基础功能是求某范围内的所有素数
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <pthread.h>
+
+#define LEFT 30000000
+#define RIGHT 30020000
+#define THRNUM 8                                // not the more the better, it depends on the CPU cores
+
+static int num = 0;                             // the number to be judged, 0 means no number, -1 means all tasks are done and threads can exit
+static pthread_mutex_t mut_num = PTHREAD_MUTEX_INITIALIZER;     // mutex lock for num
+
+static void *thr_prime(void *p)
+{
+    int i, j, mark;
+
+    while (1)
+    {
+        // critical section begin
+        pthread_mutex_lock(&mut_num);
+        while (num == 0)                        // no number to be judged
+        {
+            pthread_mutex_unlock(&mut_num);
+            sched_yield();
+            pthread_mutex_lock(&mut_num);
+        }
+        if (num == -1)
+        {
+            pthread_mutex_unlock(&mut_num);
+            break;                              // break the big while and exit until all tasks are done
+        }
+        i = num;
+        num = 0;
+        pthread_mutex_unlock(&mut_num);         // critical section end
+
+        mark = 1;
+        for (j = 2; j < i/2; j++)
+        {
+            if (i % j == 0)
+            {
+                mark = 0;
+                break;
+            }
+        }
+        if (mark)
+        {
+            printf("[%d] %d is a primer\n", (int)p, i);
+        }
+    }
+    pthread_exit(NULL);                         // thread exit but not terminate
+}
+
+int main()
+{
+    int i, err;
+    pthread_t tid[THRNUM];                      // thread pool
+
+    for (i = 0; i < THRNUM; i++)
+    {
+        err = pthread_create(tid+i, NULL, thr_prime, (void *)i);
+        if (err)
+        {
+            fprintf(stderr, "pthread_create(): %s\n", strerror(err));
+            exit(1);
+        }
+    }
+
+    for(i = LEFT; i <= RIGHT; i++)
+    {
+        // critical section begin
+        pthread_mutex_lock(&mut_num);
+        while (num != 0)                        // num == 0 means there has been a thread to take the task
+        {
+            pthread_mutex_unlock(&mut_num);
+            sched_yield();                      // unlock and wait for a thread to take the task
+            pthread_mutex_lock(&mut_num);
+        }
+        num = i;                                // now there is a thread to take the task and we can assign a new task
+        pthread_mutex_unlock(&mut_num);         // critical section end
+    }
+
+    // wait for all tasks to be done
+    // critical section begin
+    pthread_mutex_lock(&mut_num);
+    while (num != 0)                            // num != 0 means there is still a task to be done while main thread has no task to assign
+    {
+        pthread_mutex_unlock(&mut_num);
+        sched_yield();
+        pthread_mutex_lock(&mut_num);
+    }
+    num = -1;                                   // no task to assign and all tasks are done, so we can set num to -1 to call all threads to exit
+    pthread_mutex_unlock(&mut_num);             // critical section end
+
+    for (i = 0; i < THRNUM; i++)
+    {
+        pthread_join(tid[i], NULL);             // wait for all threads to exit
+    }
+
+    pthread_mutex_destroy(&mut_num);
+
+    return 0;
+}
+```
+
+值得注意的是，在我的虚拟机（分配了 8 个核心）中，当线程数量增加到 8 后执行速度到达顶峰，往后增加程序的速度不再上升，所以并不是越多线程越好，这和进程的资源密切相关
+
+### 条件变量
+
+### 信号量
+
+### 线程属性
+
+### OpenMP
 
 ## 高级 I/O
 
