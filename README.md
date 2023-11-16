@@ -351,9 +351,12 @@ FILE *tmpfile(void);
 
 ### 文件描述符
 
-- 设计`open`函数打开一个文件的过程中必然会产生一个结构体（文件表项）来描述这个文件，这个结构体记录了包括 inode、引用计数在内的文件操作信息（类似于 FILE 结构体），这些结构体的地址会被存放在进程内部的一个数组中，而文件描述符 fd 实际上就是这个数组的索引
+- 设计`open`函数打开一个文件的过程中必然会产生一个结构体（文件表项）来描述这个文件，这个结构体记录了包括指向文件 inode 的指针、引用计数在内的文件操作信息，这些结构体的地址会被存放在进程内部的一个数组中，而文件描述符 fd 实际上就是这个数组的索引
+  - 此前的标准 I/O 中的`FILE`结构体保存于用户地址空间（更详细来说是标准流的`FILE`保存在 libc.so 的数据段，其他文件的保存在堆区），记录了缓冲区的指针、文件操作函数表等，以及在`fileno`域保存了该文件的文件描述符
+  - 了解 heap pwn 的师傅们应该知道，其实`FILE`就是`_IO_FILE`，在 libio 中有定义`typedef struct _IO_FILE FILE;`
+
 - 文件描述符是整型的，但`ulimit`会限制一个用户可打开的文件数量，默认 1024
-- `fopen`内部实际上也调用了`open`，区别在于`fopen`只能打开流式文件，而`open`能打开设备文件等
+- `fopen`内部实际上也调用了`open`，在使用对象上的区别在于`fopen`只能打开流式文件，而`open`能打开设备文件等
 - 每个进程都有自己的描述符表（但会共享一个操作系统维护的文件表），负责记录进程打开的所有文件
 - 文件描述符会优先选择最小的空位，一个文件可以有多个描述符
 - 调用`close`时会将引用计数减 1，如果此时引用计数为 0 则释放文件
@@ -583,7 +586,7 @@ int fcntl(int fd, int cmd, ... /* arg */);
 ```c
 #include <sys/ioctl.h>
 
-int ioctl(int d, int request, ...)
+int ioctl(int fd, int request, ...)
 ```
 
 - 种种设备操作实际上都是使用`ioctl`实现的
@@ -2574,6 +2577,14 @@ int mytbf_destroy(mytbf_t *ptr)
 
 对于加锁解锁时机的判断，一个经验是操作变量时先想其是否是共享的、是否会造成读写冲突；在临界区内找到所有可能跳出临界区的位置并在其中对锁进行处理，这样能减少竞争和死锁的发生
 
+### 读写锁
+
+[TODO]
+
+### 自旋锁
+
+[TODO]
+
 ### 线程池
 
 线程池是为了解决管理线程数量、减少线程调度代价而诞生的，其设计类似于之前的令牌桶，管理线程发布任务和资源，其他工作线程长期存在，负责等待工作发布或领取工作并执行，这样避免了每出现一个任务就创建一个线程资源浪费，同时也减少了线程频繁创建带来的性能开销
@@ -2686,17 +2697,182 @@ int main()
 }
 ```
 
-值得注意的是，在我的虚拟机（分配了 8 个核心）中，当线程数量增加到 8 后执行速度到达顶峰，往后增加程序的速度不再上升，所以并不是越多线程越好，这和进程的资源密切相关
+值得注意的是，在我的虚拟机（分配了 8 个核心）中，当线程数量增加到 8 后执行速度到达顶峰，往后增加程序的速度不再上升，所以并不是越多线程越好，并行性能和进程持有的资源密切相关
 
 ### 条件变量
 
+条件变量是一种线程同步机制，它给多个线程提供了一个汇合的场所，允许线程以无竞争的方式等待某个特定条件的发生；条件变量本身需要由互斥锁保护
+
+pthread 提供了一套机制来创建、使用、销毁条件变量
+
+```c
+#include <pthread.h>
+
+pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+int pthread_cond_init(pthread_cond_t *restrict cond, const pthread_condattr_t *restrict attr);
+int pthread_cond_destroy(pthread_cond_t *cond);
+```
+
+- 可以直接使用`PTHREAD_COND_INITIALIZER`来静态初始化一个条件变量，此时条件变量拥有默认属性
+- 也可以使用`pthread_cond_init`来动态初始化并自定义更多相关属性
+- `pthread_cond_destroy`用于销毁一个动态初始化的条件变量，静态初始化的条件变量不需要手动销毁
+
+```c
+#include <pthread.h>
+
+int pthread_cond_wait(pthread_cond_t *restrict cond, pthread_mutex_t *restrict mutex);
+int pthread_cond_timedwait(pthread_cond_t *restrict cond, pthread_mutex_t *restrict mutex,
+                           const struct timespec *restrict abstime);
+```
+
+- `pthread_cond_wait`：阻塞当前线程并将其放入等待队列中，然后等待条件变量`cond`
+- `pthread_cond_timedwait`：阻塞当前线程并等待条件变量`cond`，并设置一个时限`abstime`，超时后不再等待并返回`ETIMEOUT`
+- 这两个函数在阻塞进程前会先解锁让出线程，因此调用前要先加锁；而在线程被唤醒函数返回前会先加锁，因此临界区结束前需要进行解锁
+- `*restrict`关键字表示在该指针的生命周期内，其指向的对象不会被别的指针所引用，有利于编译优化
+
+```c
+#include <pthread.h>
+
+int pthread_cond_broadcast(pthread_cond_t *cond);
+int pthread_cond_signal(pthread_cond_t *cond);
+```
+
+- `pthread_cond_broadcast`：唤醒所有正在等待条件变量`cond`的线程
+- `pthread_cond_signal`：唤醒正在等待条件变量`cond`所有线程中的一个
+
 ### 信号量
+
+可以使用互斥锁和条件变量实现信号量机制，以下是一个简单的信号量库
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include "mysem.h"
+
+struct mysem_st {
+    int value;
+    pthread_mutex_t mut;
+    pthread_cond_t cond;
+};
+
+mysem_t *mysem_init(int initval) {
+    struct mysem_st *me;
+    me = malloc(sizeof(*me));
+    if(me == NULL) {
+        return NULL;
+    }
+    me->value = initval;
+    pthread_mutex_init(&me->mut, NULL);
+    pthread_cond_init(&me->cond, NULL);
+
+    return me;
+}
+
+int mysem_add(mysem_t *ptr, int n) {
+    struct mysem_st *me = ptr; 
+    pthread_mutex_lock(&me->mut);
+    me->value += n;
+    pthread_cond_broadcast(&me->cond);
+    pthread_mutex_unlock(&me->mut);
+    
+    return n;
+}
+
+int mysem_sub(mysem_t *ptr, int n) {
+    struct mysem_st *me = ptr;
+    pthread_mutex_lock(&me->mut);
+    while(me->value < n) {
+        pthread_cond_wait(&me->cond, &me->mut);
+    }
+    me->value -= n;
+    pthread_mutex_unlock(&me->mut);
+    
+    return n;
+}
+
+int mysem_destroy(mysem_t *ptr) {
+    struct mysem_st *me = ptr;
+    pthread_mutex_destroy(&me->mut);
+    pthread_cond_destroy(&me->cond);
+    free(me);
+    
+    return 0;
+}
+```
 
 ### 线程属性
 
-### OpenMP
+pthread 允许我们通过线程属性来调整线程和同步对象的行为，此前创建线程、互斥量、条件变量时的涉及的`attr`参数即为属性
+
+以下两个函数用于创建和销毁 pthread 属性变量
+
+```c
+#include <pthread.h>
+
+int pthread_attr_init(pthread_attr_t *attr);
+int pthread_attr_destroy(pthread_attr_t *attr);
+```
+
+pthread 为线程定义了一些属性，这里主要介绍线程分离状态属性和线程栈属性
+
+关于线程的分离状态此前在线程终止部分已经介绍过
+
+```c
+#include <pthread.h>
+
+int pthread_attr_setdetachstate(pthread_attr_t *attr, int detachstate);
+int pthread_attr_getdetachstate(pthread_attr_t *attr, int *detachstate);
+```
+
+- 这两个函数可以用于为属性变量设置和获取分离状态属性
+- `detachstate`可以设置为以下属性
+  - `PTHREAD_CREATE_DETACHED`：线程可分离状态
+  - `PTHREAD_CREATE_JONINABLE`：线程可阻塞（joinable）状态
+
+线程栈属性用于限制线程的栈基址和栈大小
+
+```c
+#include <pthread.h>
+
+int pthread_attr_setstack(pthread_attr_t *attr, void *stackaddr, size_t stacksize);
+int pthread_attr_getstack(const pthread_attr_t *attr, void **stackaddr, size_t *stacksize);
+
+int pthread_attr_setstacksize(pthread_attr_t *attr, size_t stacksize);
+int pthread_attr_getstacksize(pthread_attr_t *attr, size_t *stacksize);
+```
+
+- 由于线程之间共用一个虚拟地址空间，所以在线程较多时留给每个线程的栈空间有可能不够用，此时可以`malloc`或`mmap`一块内存并使用以上函数将栈迁移到这块空间
+- `stacksize`不能小于`PTHREAD_STACK_MIN`
+
+### 其他
+
+#### 线程安全 I/O
+
+目前所有 stdio 中我们常用的的 I/O 函数都是线程安全的，这些函数在对缓冲区操作前都会先加锁，所以使用这些函数时不需要担心线程安全问题
+
+对于线程不安全的标准 I/O 函数，通常函数命名时都会带有`_unlocked`后缀
+
+#### 线程与信号
+
+对于一个进程，其本身拥有一个 pending 信号集而没有自身的 mask 信号集，而进程中的每个线程都拥有自己的 pending 和 mask。当进程从另一个进程接收到信号时，首先改变进程的 pending，然后与当前工作线程的 mask 按位与；而线程之间发送信号只会改变线程自身的 pending
+
+由于每个线程都有自己的 mask，所以线程可以自行屏蔽某些信号，但是由于线程之间共享一个信号处理行为，所以如果一个线程选择改变某个信号的处理方式，那么所有线程的信号处理方式都会改变
+
+pthread 提供了以下函数对线程的 mask 进行设置以及对某个线程发送信号
+
+```c
+#include <signal.h>
+
+int pthread_sigmask(int how, const sigset_t *set, sigset_t *oldset);
+int pthread_kill(pthread_t thread, int sig);
+```
+
+关于 Linux 的线程和进程的信号处理机制的更多特性，需要更深入地阅读相关的内核代码，这里不做深究
 
 ## 高级 I/O
+
+
 
 ## 进程间通信
 
