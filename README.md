@@ -2872,7 +2872,21 @@ int pthread_kill(pthread_t thread, int sig);
 
 ## 高级 I/O
 
+### 有限状态机模型、数据中继
 
+### select
+
+### poll
+
+### epoll
+
+`epoll`是 Linux 针对`poll`的改进，是 Linux 平台专属的，可移植性相对于`select`和`poll`较差
+
+### 内存映射
+
+### 文件锁
+
+### 异步 I/O
 
 ## 进程间通信
 
